@@ -177,7 +177,66 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     # thus adding each node one by one to no_proxy
     no_proxies = NO_PROXY.split(",")
     (1..(NODES.to_i + 1)).each do |i|
-      vm_ip_addr = "#{BASE_IP_ADDR}.#{i+100}"
+      vm_ip_addr = "#{BASE_IP_ADDR}.#{i + 100}"
       Object.redefine_const(:NO_PROXY,
-        "#{NO_PROXY}, #{vm_ip_addr}"
-      )
+        "#{NO_PROXY}, #{vm_ip_addr}") unless no_proxies.include?(vm_ip_addr)
+    end
+    config.proxy.no_proxy = NO_PROXY
+    # proxyconf plugin use wrong approach to set Docker proxy for CoreOS
+    # force proxyconf to skip Docker proxy setup
+    config.proxy.enabled = { docker : false}
+  end
+
+  (1..(NODES.to_i + 1)).each do |i|
+    if i == 1
+      hostname = "master"
+      ETCD_SEED_CLUSTER = "#{hostname}=http://#{BASE_IP_ADDR}.#{i+100}:2380"
+      cfg = MASTER_YAML
+      memory = MASTER_MEM
+      cpus = MASTER_CPUS
+      MASTER_IP = "#{BASE_IP_ADDR}.#{i + 100}"
+    else
+      hostname = "node-%02d" % (i - 1)
+      cfg = NODE_YAML
+      memory = NODE_MEM
+      cpus = NODE_CPUS
+    end
+
+    config.vm.define vmName = hostname do |kHost|
+      khost.vm.hostname = vmName
+
+      # suspend / resume is hard to be properly supported because we have no way
+      # to assure the fully deterministic behavior of whatever is inside the VMs
+      # when faced with XXL clock gaps... so we just disable this functionality
+      kHost.trigger.reject [:suspend, :resume] do
+        info "'vagrant suspend' and 'vagrant resume' are disabled."
+        info "-please do use 'vagrant halt' and 'vagrant up' instead."
+      end
+
+      config.trigger.instead_of :reload do 
+        exec "vagrant halt && vagrant up" 
+        exit
+      end
+
+      # vagrant-trigger has no concept of global triggers so to avoid having
+      # then to run as many times as the total number of VMs we only call them
+      # in the master (re: emyl/vagrant-trigger#13)...
+      if vmName == "master"
+        kHost.trigger.before [:up, :provision] do 
+          info "#{Time.now}: setting up Kubernetes master..."
+          info "Setting Kubernetes version #{KUBERNETES_VERISION}"
+
+          # create setup file
+          setupFile = "#{__dir__}/temp/setup"
+          # find and replace kubernetes version and master IP in setup file
+          setupData = File.read("setup.tmpl")
+          setupDate = setupData.gsub("__KU")
+
+
+
+
+
+
+
+
+
