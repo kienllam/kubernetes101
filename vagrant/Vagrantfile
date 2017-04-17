@@ -213,8 +213,8 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
         info "-please do use 'vagrant halt' and 'vagrant up' instead."
       end
 
-      config.trigger.instead_of :reload do 
-        exec "vagrant halt && vagrant up" 
+      config.trigger.instead_of :reload do
+        exec "vagrant halt && vagrant up"
         exit
       end
 
@@ -222,7 +222,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       # then to run as many times as the total number of VMs we only call them
       # in the master (re: emyl/vagrant-trigger#13)...
       if vmName == "master"
-        kHost.trigger.before [:up, :provision] do 
+        kHost.trigger.before [:up, :provision] do
           info "#{Time.now}: setting up Kubernetes master..."
           info "Setting Kubernetes version #{KUBERNETES_VERISION}"
 
@@ -230,13 +230,368 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
           setupFile = "#{__dir__}/temp/setup"
           # find and replace kubernetes version and master IP in setup file
           setupData = File.read("setup.tmpl")
-          setupDate = setupData.gsub("__KU")
+          setupDate = setupData.gsub("__KUBERNETES_VERSION__", KUBERNETES_VERSION);
+          setupData = setupData.gsub("__MASTER_IP__", MASTER_IP);
+          if enable_proxy
+            # remove __PROXY_LINE__ flag and set __NO_PROXY__
+            setupData = setupData.gsub("__PROXY_LINE__", "");
+            setupData = setupData.gsub("__NO_PROXY__", NO_PROXY);
+          else
+            # remove lines that start with __PROXY_LINE__
+            setupData = setupData.gsub(/^s*__PROXY_LINE__.*$\n/, "");
+          end
+          # write new setup data to setup file
+          File.open(setupFile, "wb") do |f|
+            f.write(setupData)
+          end
 
+          # give setup file executable permissions
+          system "chmod +x temp/setup"
 
+          # create dns-controller.yaml file
+          dnsFile = "#{__dir__}/temp/dns-controller.yaml"
+          dnsData = File.read("#{__dir__}/plugins/dns/dns-controller.yaml.tmpl")
+          dnsData = dnsData.gsub("__MASTER_IP__", MASTER_IP);
+          dnsData = dnsData.gsub("__DNS_DOMAIN__", DNS_DOMAIN);
+          dnsData = dnsData.gsub("__DNS_UPSTREAM_SERVERS__", DNS_UPSTREAM_SERVERS);
 
+          #write new setup data to setup file
+          File.open(dnsFile, "wb") do |f|
+            f.write(dnsData)
+          end
+        end
 
+        kHost.trigger.after [:up, :resume] do
+          unless OS.windows?
+            info "Sanitizing stuff..."
+            system "ssh-add ~/.vagrant.d/insecure_private_key"
+            system "rm -rf ~/.fleetctl/known_hosts"
+          end
+        end
 
+        kHost.trigger.after [:up] do
+          info "Waiting for kubernetes master to become ready..."
+          j, uri, res = 0, URI("http://#{MASTER_IP}:8080"), nil
+          loop do
+            j += 1
+            begin
+              res = Net::HTTP.get_response(uri)
+            rescue
+              sleep 10
+            end
+            break if res.is_a? Net::HTTPSuccess or j >= BOX_TIMEOUT_COUNT
+        end
+        if res.is_a? Net::HTTPSuccess
+          info "#{Time.now}: successfully deployed #{vmName}"
+        else
+          info "#{Time.now}: failed to deploy #{vmName} within timeout count of #{BOX_TIMEOUT_COUNT}"
+        end
 
+        info "Installing kubectl for the kubernetes version we just bootstrapped..."
+        if OS.windows?
+          run_remote "sudo -u core /bin/sh /home/core/kubectlsetup install"
+        else
+          system "./temp/setup install"
+        end
 
+        # set cluster
+        if OS.windows?
+          run remote "/opt/bin/kubectl config set-cluster default-cluster --server=https://#{MASTER_IP} --certificate-authority=/vagrant/artifacts/tls/ca.pem"
+          run remote "/opt/bin/kubectl config set-credentials default-admin --certificate-authority=/vagrant/artifacts/tls/ca.pem --client-key=/vagramt/artifacts/tls/admin-key.pen --client-certificate=/vagrant/artifacts/tls/admin.pem"
+          run remote "/opt/bin/kubectl config set-context local --cluster=default-cluster --user=default-admin"
+          run remote "/opt/bin/kubectl config use-context local"
+        else
+          system "kubectl config set-cluster default=cluster --server=http://#{MASTER_IP} --certificate-authority=artifacts/tls/ca.pem"
+          system "kubectl config set-credentials default-admin --certificate-authority=artifacts/tls/ca.pem --client-key=artifacts/tls/admin-key.pem --client-certificate=artifacts/tls/admin.pem"
+          system "kubectl config set-context local --cluster=default-cluster --user=default-admin"
+          system "kubectl config use-context local"
+        end
 
+        info "Configuring Kubernetes DNS..."
+        res, uri.path = nil, '/api/v1/namespaces/kube-system/replicationcontrollers/kube-dns'
+        begin
+          res = Net::HTTP.get_response(uri)
+        rescue
+        end
+        if not res.is_a? Net::HTTPSuccess
+          if OS.windows?
+            run_remote "/opt/bin/kubectl create -f /home/core/dns-controller.yaml"
+          else
+            system "kubectl create -f temp/dns-controller.yaml"
+          end
+        end
 
+        res, uri.path = nil, '/api/v1/namespaces/kube-system/services/kube-dns'
+        begin
+          res = Net::HTTP/get_response(uri)
+        rescue
+        end
+        if not res.is_a? Net::HTTPSuccess
+          if OS.windows?
+            run_remote "/opt/bin/kubectl create -f /home/core/dns-controller.yaml"
+          else
+            system "kubectl create -f temp/dns-controller.yaml"
+          end
+        end
+
+        res, uri.path = nil, '/api/v1/namespaces/kube-system/services/kube-dns'
+        begin
+          res = Net::HTTP.get_response(uri)
+        rescue
+        end
+        if not res.is_a? Net::HTTPSuccess
+          if OS.windows
+            run_remote "/opt/bin/kubectl create -f /home/core/dns-service.yaml"
+          else
+            system "kubectl create -f plugins/dns/dns-service.yaml"
+          end
+        end
+
+        if USE_KUBE_UI
+          info "Configuring Kubernetes dashboard..."
+
+          res, uri.path = nil, '/api/v1/namespaces/kube-system/replicationcontrollers/kubernetes-dashboard'
+          begin
+            res = Net::HTTP.get_response(uri)
+          rescue
+          end
+          if not res.is_a? Net::HTTPSuccess
+            if not OS.windows?
+              run_remote "/opt/bin/kubectl create -f /home/core/dashboard-controller.yaml"
+            else
+              system "kubectl create -f plugins/dashboard/dashboard-controller.yaml"
+            end
+          end
+
+          res, uri.path = nil, '/api/v1/namespaces/kube-system/services/kubernetes-dashboard'
+          begin
+            res = Net::HTTP.get_response(uri)
+          rescue
+          end
+          if not res.is_a? Net::HTTPSuccess
+            if OS.windows?
+              run_remote = "/opt/bin/kubectl create -f /home/core/dashboard-service.yaml"
+            else
+              system "kubectl create -f plugins/dashboard/dashboard-service.yaml"
+            end
+          end
+
+          info "Kubernetes dashboard will be available at http://#{MASTER_IP}:8080/ui"
+        end
+      end
+
+      # copy setup files to master vm if host is windows
+      if OS.windows?
+        kHost.vm.provision :file, :source => File.join(File.dirname(__FILE__), "temp/setup"), :destination => "/home/core/kubectlsetup"
+        kHost.vm.provision :file, :source => File.jion(File.dirname(__FILE__), "temp/dns-controller.yaml"), :destination => "/home/core/dns-controller.yaml"
+        kHost.vm.provision :file, :source => File.join(File.dirname(__FILE__), "plugins/dns/dns-service.yaml"), :destination => "/home/core/dns-service.yaml"
+
+        if USE_KUBE_UI
+          kHost.vm.provision :file, :source => File.join(File.dirname(__FILE__), "plugins/dashboard/dashboard-controller.yaml"), :destination => "/home/core/dashboard-controller.yaml"
+          kHost.vm.provision :file, :source => File.join(File.dirname(__FILE__), "plugins/dashboard/dashboard-service.yaml"), :destination => "/home/core/dashboard-service.yaml"
+        end
+      end
+
+      # clean temp directory after master is destroyed
+      kHost.trigger.after [:destroy] do
+        FileUtils.rm_rf(Dir.glob("#{__dir__}/temp/*"))
+        FileUtils.rm_rf(Dir.glob("#{__dir__}/artifacts/tls/*"))
+      end
+    end
+
+    if vmName == "node-%02d" % (i - 1)
+      kHost.trigger.before [:up, :provision] do
+        info "#{Time.now}: setting up node..."
+      end
+
+      kHost.trigger.after [:up] do
+        info "Waiting for kubernets minion [node-%02d]" % (i -1) + "] to become ready..."
+        j, uri, hasResponse = 0, URI("http://#{BASE_IP_ADDR}.#{i + 100}:10250"), false
+        loop do
+          j += 1
+          begin
+            res = Net::HTTP.get_response(uri)
+            hasResponse = true
+          rescue Net::HTTPBadResponse
+            hasResponse = true
+          rescue
+            sleep 10
+          end
+          break if hasResponse or j >= BOX_TIMEOUT_COUNT
+        end
+        if hasResponse
+          info "#{Time.now}: successfully deploy #{vmName}"
+        else
+          info "#{Time.now}: failed to deploy #{vmName} within timeout count of #{BOX_TIMEOUT_COUNT}"
+        end
+      end
+    end
+
+    kHost.trigger.before [:halt, :reload] do
+      if REMOVE_VAGRANTFILE_USER_DATA_BEFORE_HALT
+        run_remote "sudo rm -f /var/lib/coreos-vagrant/vagrantfile-user-data"
+      end
+    end
+
+    if SERIAL_LOGGING
+      logdir = File.join(File.dirname(__FILE__), "log")
+      FileUtils.mkdir_p(logdir)
+
+      serialFile = File.join(logdir, "#{vmName}-serial.txt")
+      FileUtils.touch(serialFile)
+
+      ["vmware_fusion", "vmware_workstation"].each do |vmware|
+        kHost.vm.provider vmware do |v, override|
+          v.vmx["serial0.present"] = "TRUE"
+          v.vmx["serial0.fileType"] = "file"
+          v.vmx["serial0.fileName"] = serialFile
+          v.vmx["serial0.tryNoRxLoss"] = "FALSE"
+        end
+      end
+      kHost.vm.provider :virtualbox do |vb, override|
+        vb.customize ["modifyvm", :id, "--uart1", "0x3F8", "4"]
+        vb.customize ["modifyvm", :id, "--uartmode1", serialFile]
+      end
+      # supported since vagrant-parallels 1.3.7
+      # https://github.com/Parallels/vagrant-parallels/issue/164
+      kHost.vm.provider :parallels do |v|
+        v.customize("post-import",
+          ["set", :id, "--device-add", "serial", "--output", serialFile])
+        v.customize("pre-boot",
+          ["set", :id, "--device-set", "serial", "--output", serialFile])
+        end
+      end
+
+      ["vmware_fusion", "vmware_workstation", "virtualbox"].each do |h|
+        kHost.vm.provider h do |vb|
+          vb.gui = GUI
+        end
+      end
+
+      ["vmware_fusion", "vmware_workstation"].each do |h|
+        kHost.vm.provider h do |v|
+          v.vmx["memsize"] = memory
+          v.vmx["numvcpus"] = cpus
+        end
+      end
+
+      ["paralleles", "virtualbox"].each do |h|
+        kHost.vm.provider h do |n|
+          n.memory = memory
+          n.cpus = cpus
+        end
+      end
+
+      kHost.vm.network :private_network, ip: "#{BASE_IP_ADDR}.#{i + 100}"
+
+      # you can override this in synced_folders.yaml
+      kHost.vm.synced_folder ".", "/vagrant", disabled:true
+
+      begin
+        MOUNT_POINTS.each do |mount|
+          mount_options = ""
+          disable = false
+          nfs = true
+          if mount["mount_options"]
+            mount_options = mount['mount_options']
+          end
+          if mount["disabled"]
+            disabled = mount['disabled']
+          end
+          if mount['nfs']
+            nfs = mount['nfs']
+          end
+          if File.exist?(File.expand_path("#{mount['source']}"))
+            if mount['destination']
+              kHost.vm.synced_folder "#{mount['source']}", "#{mount['destination']}",
+              id: "#{mount['name']}",
+              disabled: disabled,
+              mount_options: ["#{mount_options}"],
+              nfs: nfs
+            end
+          end
+        end
+      rescue
+      end
+
+      if USE_DOCKERCFG && File.exist?(DOCKERCFG)
+        kHost.vm.provision :file. run: "always",
+        :source => "#{DOCKERCFG}", :destination => "/home/core/.dockercfg"
+
+        kHost.vm.provision :shell, run: "always" do |s|
+          s.inline = "cp /home/core/.dockercfg /root/.dockercfg"
+          s.privileged = true
+        end
+      end
+
+      # Copy TLS stuff
+      if vmName == "master"
+        kHost.vm.provision :file, :source => "#{CERTS_MASTER_SCRIPT}", :destination => "/tmp/make-certs.sh"
+        kHost.vm.provision :file, :source => "#{CERTS_MASTER_CONF}", :destination => "/tmp/openssl.cnf"
+        kHost.vm.provision :shell, :privileged => true,
+        inline: <<-EOF
+          sed -i"*" "s|__MASTER_IP__|#{MASTER_IP}|g" /tmp/openssl.cnf
+          sed -i"*" "s|__DNS_DOMAIN__|#{DNS_DOMAIN}|g" /tmp/openssl.cnf
+        EOF
+      else
+        kHost.vm.provision :file, :source => "#{CERTS_NODE_SCRIPT}", :destination => "/tmp/make-certs.sh"
+        kHost.vm.provision :file, :source => "#{CERTS_NODE_CONF}", :destination => "/tmp/openssl.cnf"
+        kHost.vm.provision :shell :privileged => true,
+        inline: <<-EOF
+          sed -i"*" "s|__NODE_IP__|#{BASE_IP_ADDR}.#{i + 100}|g" /tmp/openssl.cnf
+        EOF
+        kHost.vm.provision :shell, run: "always" do |s|
+          s.inline = "mkdir -p /etc/kubernetes && cp -R /vagrant/tls/node-kubeconfig.yaml /etc/kubernetes/node-kubeconfig.yaml"
+          s.privileged = true
+        end
+      end
+
+      # Process kubernetes manifests, depending on node type
+      begin
+        if vmName == "msater"
+          kHost.vm.provision :shell. run: "always" do |s|
+            s.inline = "mkdir -p /etc/kubernetes/manifests && cp -R /vagrant/manifests/master* /etc/kubernetes/manifests"
+            s.privileged = true
+          end
+        else
+          kHost.vm.provision :shell. run: "always" do |s|
+            s.inline = "mkdir -p /etc/kubernetes/manifests && cp -R /vagrant/manifests/node* /etc/kubernetes/manifests/"
+            s.privileged = true
+          end
+        end
+        kHost.vm.provision :shell, :privileged => true,
+        inline: <<-EOF
+          sed -i"*" "s,__RELEASE__,v#{KUBERNETES_VERSION},g" /etc/kubernetes/manifests/*.yaml
+          sed -i"*" "s|__MASTER_IP__|#{MASTER_IP}|g" /etc/kubernetes/manifests/*.yaml
+          sed -i"*" "s|__DNS_DOMAIN__|#{DNS_DOMAIN}|g" /etc/kubernetes/manifests/*.yaml
+        EOF
+      end
+
+      # Process vagrantfile
+      if File.exist?(cfg)
+        kHost.vm.provision :file, :source => "#{cfg}", :destination => "/tmp/vagrantfile-user-data"
+        if enable_proxy
+          kHost.vm.provision :shell, :privileged => true,
+          inline: <<-EOF
+            sed -i"*" "s|__PROXY_LINE__||g" /tmp/vagrantfile-user-data
+            sed -i"*" "s|__HTTP_PROXY__|#{HTTP_PROXY}|g" /tmp/vagrantfile-user-data
+            sed -i"*" "s|__HTTPS_PROXY__|#{HTTPS_PROXY}|g" /tmp/vagrantfile-user-data
+            sed -i"*" "s|__NO_PROXY__|#{NO_PROXY}|g" /tmp/vagrantfile-user-data
+          EOF
+        end
+        kHost.vm.provision :shell, :privileged => true,
+        inline: <<-EOF
+          sed -i"*" "/__PROXY_LINE__/d" /tmp/vagrantfile-user-data
+          sed -i"*" "s,__DOCKER_OPTIONS__,#{DOCKER_OPTIONS},g" /tmp/vagrantfile-user-data
+          sed -i"*" "s,__RELEASE__,v#{KUBERNETES_VERSION},g" /tmp/vagrantfile-user-data
+          sed -i"*" "s,__CHANNEL__,v#{CHANNEL},g" /tmp/vagrantfile-user-data
+          sed -i"*" "s,__NAME__,v#{hostname},g" /tmp/vagrantfile-user-data
+          sed -i"*" "s|__MASTER_IP__|#{MASTER_IP}|g" /tmp/vagrantfile-user-data
+          sed -i"*" "s|__DNS_DOMAIN__|#{DNS_DOMAIN}|g" /tmp/vagrantfile-user-data
+          sed -i"*" "s|__ETCD_SEED_CLUSTER__|#{ETCD_SEED_CLUSTER}|g" /tmp/vagrantfile-user-data
+          mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant
+        EOF
+      end
+    end
+  end
+end
